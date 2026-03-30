@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -331,30 +332,29 @@ class MCPSessionManager:
 
             return response, new_session_id
 
-        # For other requests, require a valid session ID
-        if not session_id:
-            # No session ID provided - this is an error for non-initialize requests
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_data.get("id"),
-                "error": {
-                    "code": -32002,
-                    "message": "Session ID required. Please include Mcp-Session-Id header from initialize response.",
-                },
-            }
-            return response, ""
-
-        # Check if session exists
-        if session_id not in self.sessions:
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_data.get("id"),
-                "error": {
-                    "code": -32002,
-                    "message": f"Invalid session ID: {session_id}. Session may have expired or does not exist.",  # TODO: Break long line
-                },
-            }
-            return response, ""
+        # For other requests, find a valid session
+        if not session_id or session_id not in self.sessions:
+            # No valid session ID - try to use the most recently active session
+            if self.sessions:
+                most_recent = max(
+                    self.sessions.items(),
+                    key=lambda item: item[1].last_activity,
+                )
+                session_id = most_recent[0]
+                logger.info(
+                    f"No valid session ID provided for '{method}', "
+                    f"using most recent session: {session_id}"
+                )
+            else:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_data.get("id"),
+                    "error": {
+                        "code": -32002,
+                        "message": "No active sessions. Send an initialize request first.",
+                    },
+                }
+                return response, ""
 
         # Use existing session
         session = self.sessions[session_id]
@@ -459,10 +459,87 @@ def create_app(server_command: List[str], session_timeout: int = 300) -> FastAPI
                 },
             )
 
+    @app.get("/mcp")
+    async def handle_mcp_get(request: Request):
+        """Handle GET /mcp for SSE notification stream (MCP StreamableHTTP spec).
+
+        Per the MCP StreamableHTTP specification, clients may open a GET request
+        to /mcp to receive server-initiated notifications via Server-Sent Events.
+        Since stdio-based servers don't push unsolicited notifications, we keep
+        the stream open with periodic heartbeats until the client disconnects.
+        """
+        session_id = request.headers.get("Mcp-Session-Id")
+
+        logger.info(
+            f"GET /mcp - session_id={session_id or 'none'}, "
+            f"active_sessions={list(session_manager.sessions.keys())[:5]}"
+        )
+
+        # If session ID provided but not found, open standalone stream anyway
+        # (claude.ai may send stale session IDs during reconnection)
+        if session_id and session_id not in session_manager.sessions:
+            logger.warning(f"GET /mcp - session {session_id} not found, opening standalone SSE stream")
+            session_id = None
+
+        if session_id:
+            session_manager.sessions[session_id].last_activity = time.time()
+
+        logger.info(f"SSE stream opened for session {session_id or 'none (standalone)'}")
+
+        async def sse_stream():
+            """Keep SSE connection alive with periodic heartbeats."""
+            try:
+                while True:
+                    yield ": heartbeat\n\n"
+                    await asyncio.sleep(15)
+
+                    # If tied to a session, check it's still valid
+                    if session_id and session_id not in session_manager.sessions:
+                        break
+
+                    # Update activity so session doesn't expire
+                    if session_id and session_id in session_manager.sessions:
+                        session_manager.sessions[session_id].last_activity = time.time()
+            except asyncio.CancelledError:
+                logger.info(f"SSE stream closed for session {session_id or 'standalone'}")
+
+        headers = {
+            "Cache-Control": "no-cache, no-transform",
+        }
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+
+        return StreamingResponse(
+            sse_stream(),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+
+    @app.delete("/mcp")
+    async def handle_mcp_delete(request: Request):
+        """Handle DELETE /mcp to terminate a session (MCP StreamableHTTP spec)."""
+        session_id = request.headers.get("Mcp-Session-Id")
+
+        if not session_id or session_id not in session_manager.sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Session not found"},
+            )
+
+        session = session_manager.sessions.pop(session_id)
+        await session.close()
+        logger.info(f"Session {session_id} terminated via DELETE")
+
+        return JSONResponse(status_code=200, content={"status": "session_terminated"})
+
     @app.post("/mcp/")
     async def handle_mcp_trailing(request: Request):
         """Handle MCP requests with trailing slash."""
-        # Origin validation is handled in handle_mcp
         return await handle_mcp(request)
+
+    @app.get("/mcp/")
+    async def handle_mcp_get_trailing(request: Request):
+        """Handle GET /mcp/ with trailing slash."""
+        return await handle_mcp_get(request)
 
     return app

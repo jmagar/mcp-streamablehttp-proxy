@@ -91,7 +91,7 @@ POST /mcp
   "jsonrpc": "2.0",
   "method": "initialize",
   "params": {
-    "protocolVersion": "2024-11-05",
+    "protocolVersion": "2025-06-18",
     "capabilities": {},
     "clientInfo": {"name": "client", "version": "1.0"}
   },
@@ -103,7 +103,7 @@ Response Headers: Mcp-Session-Id: <sacred-uuid>
 {
   "jsonrpc": "2.0",
   "result": {
-    "protocolVersion": "2024-11-05",
+    "protocolVersion": "2025-06-18",
     "capabilities": {},
     "serverInfo": {"name": "server", "version": "1.0"}
   },
@@ -178,10 +178,10 @@ LOG_FILE=/var/log/mcp-proxy.log  # Enable file logging blessing
 - Tool discovery support
 
 **❌ Not Implemented (By Divine Design!):**
-- Authentication (Traefik's job!)
-- CORS handling (Traefik's job!)
-- SSL/TLS (Traefik's job!)
-- Rate limiting (Traefik's job!)
+- Authentication (SWAG's job!)
+- CORS handling (SWAG's job!)
+- SSL/TLS (SWAG's job!)
+- Rate limiting (SWAG's job!)
 
 **⚡ The proxy focuses on protocol translation - all else is delegated! ⚡**
 
@@ -212,20 +212,29 @@ mcp-streamablehttp-proxy --log-level debug <server>
 ### Docker Deployment - The Containerized Glory!
 ```dockerfile
 FROM python:3.11-slim
+# Install via pixi (blessed!) or pip
 RUN pip install mcp-streamablehttp-proxy
+ENV MCP_BIND_HOST=0.0.0.0
 CMD ["mcp-streamablehttp-proxy", "--host", "0.0.0.0", "python", "-m", "mcp_server_fetch"]
 ```
 
-### With Traefik - The Divine Gateway Integration!
-```yaml
-services:
-  mcp-fetch:
-    image: mcp-fetch-proxy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.mcp-fetch.rule=Host(`mcp-fetch.${BASE_DOMAIN}`)"
-      - "traefik.http.services.mcp-fetch.loadbalancer.server.port=3000"
-      - "traefik.http.middlewares.mcp-auth.forwardauth.address=http://auth:8000/verify"
+### With SWAG - The Divine Gateway Integration!
+```nginx
+# /config/nginx/proxy-confs/mcp-service.subdomain.conf
+server {
+    listen 443 ssl;
+    server_name mcp-service.${BASE_DOMAIN};
+
+    location = /_oauth_verify {
+        internal;
+        proxy_pass http://auth:8000/verify;
+        proxy_set_header Authorization $http_authorization;
+    }
+    location /mcp {
+        auth_request /_oauth_verify;
+        proxy_pass http://mcp-fetch:3000;
+    }
+}
 ```
 
 **⚡ Always bind to 0.0.0.0 in containers - localhost is container prison! ⚡**
@@ -239,7 +248,7 @@ mcp-streamablehttp-proxy  # No server = No purpose!
 ```
 
 **⚡ FORBIDDEN: Exposing to public internet without auth! ⚡**
-- Always use Traefik with ForwardAuth!
+- Always deploy behind SWAG with auth_request for ForwardAuth!
 - Never bind to 0.0.0.0 without protection!
 - Session IDs are not authentication!
 
@@ -270,7 +279,7 @@ mcp-streamablehttp-proxy python -m mcp_echo_server
 # Verify with curl
 curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05"},"id":1}'
+  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}'
 
 # Use returned session ID for subsequent requests!
 ```
